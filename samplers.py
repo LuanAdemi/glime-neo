@@ -1,26 +1,68 @@
 from abc import abstractmethod, ABC
-from copy import copy
+from copy import deepcopy
 import numpy as np
-from typing import Callable, List, Tuple, Final
+from typing import Callable, List, Tuple, Final, Literal
 
 from concurrent.futures import ThreadPoolExecutor
 
 from skimage.filters import gaussian
-from tqdm import tqdm
+from tqdm import tqdm, trange
 
 import torch
 
 from models import LatentModel, GLOW
 
+from matplotlib import pyplot as plt
 
-def exponential_kernel(instance, perturbation, kernel_width=0.5):
+import random
+
+def latent_to_device(latent: List[torch.Tensor], device: torch.device) -> List[torch.Tensor]:
+    return [l.to(device) for l in latent]
+
+def plot_representation(representation: np.ndarray, segments: np.ndarray) -> None:
+    """
+    Plot the representation of a perturbation.
+
+    Args:
+    representation (np.ndarray): The representation of the perturbation.
+    segments (np.ndarray): A 2D array of the same shape as the instance where each pixel is assigned an integer label (H, W).
+    title (str): The title of the plot.
+    """
+    representation_map = np.zeros_like(segments)
+    for i, s in enumerate(np.unique(segments)):
+        representation_map[segments == s] = representation[i]
+        plt.imshow(representation_map, cmap='gray')
+
+def exponential_kernel(instance, perturbation, kernel_width=0.5, distance_metric: Literal['cosine', 'euclidean'] = 'cosine') -> float:
+    """
+    Compute the similarity between an instance and a perturbation using an exponential kernel.
+    
+    Args:
+    instance (np.ndarray): The instance to be explained.
+    perturbation (np.ndarray): The perturbation to be applied to the instance.
+
+    Returns:
+    float: The similarity between the instance and the perturbation.
+    """
     # use cosine similarity
     instance = instance.flatten()
     perturbation = perturbation.flatten()
-    d = np.dot(instance, perturbation) / (np.linalg.norm(instance) * np.linalg.norm(perturbation))
+
+    if distance_metric == 'cosine':
+        d = np.dot(instance, perturbation) / (np.linalg.norm(instance) * np.linalg.norm(perturbation))
+    elif distance_metric == 'euclidean':
+        d = np.linalg.norm(instance - perturbation)
     return np.exp(-d **2 / kernel_width ** 2)
 
 class AbstractSampler(ABC):
+    """
+    An abstract class for samplers. Samplers are used to generate samples for LIME explanations.
+
+    Args:
+    instance (np.ndarray): The input instance to be explained (C, H, W).
+    segments (np.ndarray): A 2D array of the same shape as the instance where each pixel is assigned an integer label (H, W).
+    kernel_fn (Callable): A function that computes the similarity between two images.
+    """
     def __init__(self, instance, segments: np.ndarray, kernel_fn: Callable) -> None:
         self.instance: Final = instance
         self.kernel: Final = kernel_fn
@@ -34,6 +76,15 @@ class AbstractSampler(ABC):
         pass
 
 class LIMESampler(AbstractSampler):
+    """
+    An boilerplate for standard LIME samplers. This class should not be used directly, but rather subclassed to implement specific sampling strategies.
+
+    Args:
+    instance (np.ndarray): The input instance to be explained (C, H, W).
+    segments (np.ndarray): A 2D array of the same shape as the instance where each pixel is assigned an integer label (H, W).
+    kernel_fn (Callable): A function that computes the similarity between two images.
+    fudged_image (np.ndarray): A fudged version of the input instance used to generate samples.
+    """
     def __init__(self, instance: np.ndarray, segments: np.ndarray, kernel_fn: Callable, fudged_image: np.ndarray) -> None:
         super().__init__(instance, segments, kernel_fn)
         self.fudged_image: Final = fudged_image
@@ -66,15 +117,34 @@ class LIMESampler(AbstractSampler):
         return samples
 
 class BlackOutSampler(LIMESampler):
+    """
+    A sampler that generates samples by blacking out segments of the input instance.
+    """
     def __init__(self, instance: np.ndarray, segments: np.ndarray, kernel_fn: Callable) -> None:
         super().__init__(instance, segments, kernel_fn, np.zeros_like(instance))
 
 class BlurSampler(LIMESampler):
+    """
+    A sampler that generates samples by blurring segments of the input instance.
+
+    Args:
+    instance (np.ndarray): The input instance to be explained (C, H, W).
+    segments (np.ndarray): A 2D array of the same shape as the instance where each pixel is assigned an integer label (H, W).
+    kernel_fn (Callable): A function that computes the similarity between two images.
+    """
     def __init__(self, instance: np.ndarray,  segments: np.ndarray, kernel_fn: Callable) -> None:
         blurred_instance = gaussian(instance, channel_axis=0, sigma=10) * 255
         super().__init__(instance, segments, kernel_fn, blurred_instance)
 
 class MeanSampler(LIMESampler):
+    """
+    A sampler that generates samples by replacing segments of the input instance with the mean of the segment.
+
+    Args:
+    instance (np.ndarray): The input instance to be explained (C, H, W).
+    segments (np.ndarray): A 2D array of the same shape as the instance where each pixel is assigned an integer label (H, W).
+    kernel_fn (Callable): A function that computes the similarity between two images.
+    """
     def __init__(self, instance: np.ndarray, segments: np.ndarray, kernel_fn: Callable) -> None:
         # calculate instance mean for each segment
         mean_instance = np.zeros_like(instance)
@@ -84,38 +154,131 @@ class MeanSampler(LIMESampler):
         super().__init__(instance, segments, kernel_fn, mean_instance)
 
 
-class FlowSampler(AbstractSampler):
-    def __init__(self, instance: np.ndarray, segments: np.ndarray, kernel_fn: Callable, flow: GLOW, preprocessor: Callable, basis: List[np.ndarray]) -> None:
+class LatentSampler(AbstractSampler):
+    """A sampler that generates samples using latent space manipulation.
+
+    The idea is to encode the input instance into a latent space using a model and manipulate the latent representation to generate samples.
+    Manipulation is done using a list of latent vectors (manipulators) added to the latent representation of the instance with random weights.
+    
+    Args:
+    
+    instance (np.ndarray): The input instance to be explained (C, H, W).
+    segments (np.ndarray): A 2D array of the same shape as the instance where each pixel is assigned an integer label (H, W).
+    kernel_fn (Callable): A function that computes the similarity between two images.
+    model (LatentModel): A model that can encode and decode instances into a latent space.
+    preprocessor (Callable): A function that preprocesses the input instance before feeding it to the model.
+    manipulators (List[np.ndarray]): A list of latent vectors to be added to the latent representation of the instance.
+    """
+    def __init__(self, instance, segments: np.ndarray, kernel_fn: Callable, model: LatentModel, preprocessor: Callable, manipulators: List[np.ndarray]) -> None:
         super().__init__(instance, segments, kernel_fn)
-        self.flow: Final = flow
-        self.basis: Final = basis
+
+        self.model: Final = model
+        self.manipulators: Final = manipulators
         self.preprocessor: Final = preprocessor
 
-        self.device = self.flow.device
+        self.device = self.model.device
 
         self.instance_tensor = self.preprocessor(self.instance.transpose(1, 2, 0)).to(self.device)
+
+    @staticmethod
+    def get_representation(instance: np.ndarray, pertubation: np.ndarray, segments: np.ndarray) -> np.ndarray:
+        """
+        Compute the representation of a perturbation. 
         
+        The representation is the norm (Euclidean distance) between the instance and perturbation segments.
 
-    def generate_sample(flow, instance_tensor, latent_instance: np.ndarray, basis: np.ndarray, kernel: Callable) -> Tuple[np.ndarray, np.ndarray, float]:
-        z = copy(latent_instance)
-        z[0] += torch.normal(mean=0, std=0.2, size=z[0].shape).to(z[0].device)
+        Args:
+        instance (np.ndarray): The instance to be explained (C, H, W).
+        perturbation (np.ndarray): The perturbation to be applied to the instance (C, H, W).
+        segments (np.ndarray): A 2D array of the same shape as the instance where each pixel is assigned an integer label (H, W).
 
-        with torch.no_grad():
-            perturbation = flow.decode(z)[0].cpu().numpy()
-
-        weight = kernel(instance_tensor.cpu().numpy(), perturbation)
-
-        return z, perturbation, weight
+        Returns:
+        np.ndarray: The representation of the perturbation.
+        """
         
-    def sample(self, n_samples: np.ndarray, progress=True) -> List[Tuple[np.ndarray, np.ndarray, float]]:
-        with torch.no_grad():
-            latent_instance = self.flow.encode(self.instance_tensor.unsqueeze(0))
+        representation = np.zeros(np.unique(segments).shape[0])
 
+        for i in np.unique(segments):
+            # the current segment
+            segment = segments == i
+
+            # Extract the instance and perturbation data for the current segment
+            instance_segment = instance[:, segment]
+            perturbation_segment = pertubation.squeeze()[:, segment]
+
+             # Use the mean difference between the instance and perturbation segments as the representation
+            representation[i-1] = np.mean(np.abs(instance_segment - perturbation_segment))
+        
+        return representation
+    
+    @staticmethod
+    def random_walk(latent_instance: torch.Tensor, manipulators: torch.Tensor, radius: float) -> Tuple[torch.Tensor, float]:
+        """
+        Walk in the latent space in the direction of a random manipulator until a certain distance is reached.
+
+        The distance is controlled by the radius parameter. The radius is the maximum distance that can be traveled in the latent space from the instance.
+        
+        Args:
+        latent_instance (torch.Tensor): The latent representation of the input instance.
+        manipulators (List[torch.Tensor]): A list of latent vectors to be added to the latent representation of the instance.
+        radius (float): The maximum distance that can be traveled in the latent space from the instance.
+
+        Returns:
+        Tuple[torch.Tensor, float]: A tuple containing the new latent representation and the distance traveled.
+        """
+        z = deepcopy(latent_instance)
+
+        cummulated_direction = torch.zeros_like(z[0])
+
+        while True:
+            if torch.norm(cummulated_direction) >= radius:
+                break
+
+            # sample a random manipulator
+            manipulator = random.choice(manipulators)
+
+            # sample a random weight
+            r = torch.normal(0, 0.3, size=(1,))
+
+            # walk in the direction of the manipulator
+            z[0] += r * manipulator
+
+            # update the distance traveled
+            cummulated_direction += r * manipulator
+
+        return z, torch.norm(cummulated_direction).item()
+        
+    def sample(self, n_samples: np.ndarray, progress=True, radius: float = 12) -> List[Tuple[np.ndarray, np.ndarray, float]]:
+        with torch.no_grad():
+            latent_instance = self.model.encode(self.instance_tensor.unsqueeze(0))
+            latent_instance = latent_to_device(latent_instance, "cpu")
+
+        latents = []
         samples = []
+        mean_distance = 0
 
+        # multi-threaded random walking
         with ThreadPoolExecutor() as executor:
-            futures = [executor.submit(FlowSampler.generate_sample, self.flow, self.instance_tensor, latent_instance, self.basis, self.kernel) for _ in range(n_samples)]
-            for future in tqdm(futures, total=n_samples, disable=not progress):
-                samples.append(future.result())
+            futures = []
+            for _ in range(n_samples):
+                futures.append(executor.submit(LatentSampler.random_walk, latent_instance, self.manipulators, radius))
 
-            return samples
+            for future in futures:
+                latent, distance = future.result()
+                latents.append(latent)
+                mean_distance += distance
+        
+        # single-threaded inference
+        for latent in tqdm(latents, total=n_samples, disable=not progress):
+            latent = latent_to_device(latent, self.model.device)
+            
+            with torch.no_grad():
+                perturbation = self.model.decode(latent)[0].cpu().numpy()
+
+            weight = self.kernel(self.instance, perturbation)
+
+            representation = LatentSampler.get_representation(self.instance, perturbation, self.segments)
+
+            samples.append((representation, perturbation, weight))
+
+        return samples
