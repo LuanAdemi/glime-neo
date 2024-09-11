@@ -6,11 +6,11 @@ from typing import Callable, List, Tuple, Final, Literal
 from concurrent.futures import ThreadPoolExecutor
 
 from skimage.filters import gaussian
-from tqdm import tqdm, trange
+from tqdm import tqdm
 
 import torch
 
-from models import LatentModel, GLOW
+from models import LatentModel
 
 from matplotlib import pyplot as plt
 
@@ -44,7 +44,6 @@ def exponential_kernel(instance, perturbation, kernel_width=0.5, distance_metric
     Returns:
     float: The similarity between the instance and the perturbation.
     """
-    # use cosine similarity
     instance = instance.flatten()
     perturbation = perturbation.flatten()
 
@@ -169,12 +168,13 @@ class LatentSampler(AbstractSampler):
     preprocessor (Callable): A function that preprocesses the input instance before feeding it to the model.
     manipulators (List[np.ndarray]): A list of latent vectors to be added to the latent representation of the instance.
     """
-    def __init__(self, instance, segments: np.ndarray, kernel_fn: Callable, model: LatentModel, preprocessor: Callable, manipulators: List[np.ndarray]) -> None:
+    def __init__(self, instance, segments: np.ndarray, kernel_fn: Callable, model: LatentModel, preprocessor: Callable, manipulators: List[np.ndarray], radius: float) -> None:
         super().__init__(instance, segments, kernel_fn)
 
         self.model: Final = model
         self.manipulators: Final = manipulators
         self.preprocessor: Final = preprocessor
+        self.radius: Final = radius
 
         self.device = self.model.device
 
@@ -206,8 +206,9 @@ class LatentSampler(AbstractSampler):
             instance_segment = instance[:, segment]
             perturbation_segment = pertubation.squeeze()[:, segment]
 
-             # Use the mean difference between the instance and perturbation segments as the representation
-            representation[i-1] = np.mean(np.abs(instance_segment - perturbation_segment))
+             # Use rescaled euclidean distance as the representation
+            representation[i-1] = np.linalg.norm(instance_segment.flatten() - perturbation_segment.flatten())
+            
         
         return representation
     
@@ -248,7 +249,7 @@ class LatentSampler(AbstractSampler):
 
         return z, torch.norm(cummulated_direction).item()
         
-    def sample(self, n_samples: np.ndarray, progress=True, radius: float = 12) -> List[Tuple[np.ndarray, np.ndarray, float]]:
+    def sample(self, n_samples: np.ndarray, progress=True) -> List[Tuple[np.ndarray, np.ndarray, float]]:
         with torch.no_grad():
             latent_instance = self.model.encode(self.instance_tensor.unsqueeze(0))
             latent_instance = latent_to_device(latent_instance, "cpu")
@@ -261,7 +262,7 @@ class LatentSampler(AbstractSampler):
         with ThreadPoolExecutor() as executor:
             futures = []
             for _ in range(n_samples):
-                futures.append(executor.submit(LatentSampler.random_walk, latent_instance, self.manipulators, radius))
+                futures.append(executor.submit(LatentSampler.random_walk, latent_instance, self.manipulators, self.radius))
 
             for future in futures:
                 latent, distance = future.result()
