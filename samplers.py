@@ -1,7 +1,7 @@
 from abc import abstractmethod, ABC
 from copy import deepcopy
 import numpy as np
-from typing import Callable, List, Tuple, Final, Literal
+from typing import Any, Callable, List, Tuple, Final, Literal, override
 
 from concurrent.futures import ThreadPoolExecutor
 
@@ -76,7 +76,7 @@ class AbstractSampler(ABC):
 
 class LIMESampler(AbstractSampler):
     """
-    An boilerplate for standard LIME samplers. This class should not be used directly, but rather subclassed to implement specific sampling strategies.
+    A boilerplate for standard LIME samplers. This class should not be used directly, but rather subclassed to implement specific sampling strategies.
 
     Args:
     instance (np.ndarray): The input instance to be explained (C, H, W).
@@ -102,6 +102,7 @@ class LIMESampler(AbstractSampler):
 
         return representation, perturbation, weight
     
+    @override
     def sample(self, n_samples: np.ndarray, progress=True) -> List[Tuple[np.ndarray, np.ndarray, float]]:
 
         samples = []
@@ -110,7 +111,7 @@ class LIMESampler(AbstractSampler):
 
         with ThreadPoolExecutor() as executor:
             futures = [executor.submit(LIMESampler.generate_sample, self.instance, self.fudged_image, self.segments, n_features, self.kernel) for _ in range(n_samples)]
-            for future in tqdm(futures, total=n_samples, disable=not progress):
+            for future in tqdm(futures, total=n_samples, disable=not progress, desc='Generating Samples'):
                 samples.append(future.result())
 
         return samples
@@ -229,13 +230,16 @@ class LatentSampler(AbstractSampler):
         """
         z = deepcopy(latent_instance)
 
+        assert len(manipulators) > 0, "At least one manipulator is required."
+        assert radius > 0, "The radius must be greater than zero."
+
         cummulated_direction = torch.zeros_like(z[0])
 
         while True:
             if torch.norm(cummulated_direction) >= radius:
                 break
 
-            # sample a random manipulator
+            # get a random manipulator
             manipulator = random.choice(manipulators)
 
             # sample a random weight
@@ -248,11 +252,16 @@ class LatentSampler(AbstractSampler):
             cummulated_direction += r * manipulator
 
         return z, torch.norm(cummulated_direction).item()
+    
+    @torch.no_grad()
+    def _get_latent_instance(self):
+        latent_instance = self.model.encode(self.instance_tensor.unsqueeze(0))
+        latent_instance = latent_to_device(latent_instance, self.device)
+        return latent_instance
         
+    @override
     def sample(self, n_samples: np.ndarray, progress=True) -> List[Tuple[np.ndarray, np.ndarray, float]]:
-        with torch.no_grad():
-            latent_instance = self.model.encode(self.instance_tensor.unsqueeze(0))
-            latent_instance = latent_to_device(latent_instance, "cpu")
+        latent_instance = self._get_latent_instance()
 
         latents = []
         samples = []
@@ -264,14 +273,14 @@ class LatentSampler(AbstractSampler):
             for _ in range(n_samples):
                 futures.append(executor.submit(LatentSampler.random_walk, latent_instance, self.manipulators, self.radius))
 
-            for future in futures:
+            for future in tqdm(futures, desc='Random Walking', total=n_samples, disable=not progress):
                 latent, distance = future.result()
                 latents.append(latent)
                 mean_distance += distance
         
-        # single-threaded inference
-        for latent in tqdm(latents, total=n_samples, disable=not progress):
-            latent = latent_to_device(latent, self.model.device)
+        # single-threaded decoding
+        for latent in tqdm(latents, total=n_samples, disable=not progress, desc='Decoding'):
+            latent = latent_to_device(latent, self.device)
             
             with torch.no_grad():
                 perturbation = self.model.decode(latent)[0].cpu().numpy()
@@ -283,3 +292,13 @@ class LatentSampler(AbstractSampler):
             samples.append((representation, perturbation, weight))
 
         return samples
+    
+
+class InpaintingSampler(AbstractSampler):
+    def __init__(self, instance, segments: np.ndarray, kernel_fn: Callable[..., Any]) -> None:
+        super().__init__(instance, segments, kernel_fn)
+
+class DiffusionSampler(AbstractSampler):
+    def __init__(self, instance, segments: np.ndarray, kernel_fn: Callable[..., Any]) -> None:
+        super().__init__(instance, segments, kernel_fn)
+

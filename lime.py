@@ -33,10 +33,10 @@ class ImageExplainer(object):
 
         return torch.stack(batch)
 
+    @torch.no_grad()
     def collect_predictions(self, batch: torch.Tensor) -> np.ndarray:
-        with torch.no_grad():
-            predictions = self.model(batch).cpu().numpy()
-            predictions = torch.nn.functional.sigmoid(torch.from_numpy(predictions)).numpy()
+        predictions = self.model(batch).cpu().numpy()
+        predictions = torch.nn.functional.sigmoid(torch.from_numpy(predictions)).numpy()
 
         return predictions
 
