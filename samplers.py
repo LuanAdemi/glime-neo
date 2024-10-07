@@ -1,5 +1,4 @@
 from abc import abstractmethod, ABC
-from copy import deepcopy
 import numpy as np
 from typing import Any, Callable, List, Tuple, Final, Literal, override
 
@@ -18,6 +17,9 @@ import random
 
 def latent_to_device(latent: List[torch.Tensor], device: torch.device) -> List[torch.Tensor]:
     return [l.to(device) for l in latent]
+
+def latent_copy(latent: List[torch.Tensor]) -> List[torch.Tensor]:
+    return [l.clone() for l in latent]
 
 def plot_representation(representation: np.ndarray, segments: np.ndarray) -> None:
     """
@@ -92,11 +94,12 @@ class LIMESampler(AbstractSampler):
 
     def generate_sample(instance: np.ndarray, fudged_image: np.ndarray, segments: np.ndarray, n_features: int, kernel: Callable) -> Tuple[np.ndarray, np.ndarray]:
         representation = np.random.randint(0, 2, n_features)
-        perturbation = np.zeros_like(instance)
+        perturbation = instance.copy()
 
         for i in range(n_features):
+            if representation[i] == 1: continue
             segment_id = i+1  # skimage.segmentation.slic starts from 1
-            perturbation[:, segments == segment_id] = fudged_image[:, segments == segment_id] if representation[i] == 0 else instance[:, segments == segment_id]
+            perturbation[:, segments == segment_id] = fudged_image[:, segments == segment_id]
 
         weight = kernel(instance, perturbation)
 
@@ -133,7 +136,7 @@ class BlurSampler(LIMESampler):
     kernel_fn (Callable): A function that computes the similarity between two images.
     """
     def __init__(self, instance: np.ndarray,  segments: np.ndarray, kernel_fn: Callable) -> None:
-        blurred_instance = gaussian(instance, channel_axis=0, sigma=10) * 255
+        blurred_instance = gaussian(instance, channel_axis=0, sigma=10)
         super().__init__(instance, segments, kernel_fn, blurred_instance)
 
 class MeanSampler(LIMESampler):
@@ -153,6 +156,43 @@ class MeanSampler(LIMESampler):
 
         super().__init__(instance, segments, kernel_fn, mean_instance)
 
+class GrayOutSampler(LIMESampler):
+    """
+    A sampler that generates samples by adding noise to segments of the input instance.
+
+    Args:
+    instance (np.ndarray): The input instance to be explained (C, H, W).
+    segments (np.ndarray): A 2D array of the same shape as the instance where each pixel is assigned an integer label (H, W).
+    kernel_fn (Callable): A function that computes the similarity between two images.
+    """
+    def __init__(self, instance: np.ndarray, segments: np.ndarray, kernel_fn: Callable) -> None:
+        noise = np.full_like(instance, 0.5)
+        super().__init__(instance, segments, kernel_fn, noise)
+
+
+class IdentitySampler(AbstractSampler):
+    """
+    A sampler that always returns the input instance as the sample itself.
+
+    This sampler is not indented to be used in practice, but rather as a baseline for sanity checks in e.g. sampler metrics.
+
+    Args:
+    instance (np.ndarray): The input instance to be explained (C, H, W).
+    segments (np.ndarray): A 2D array of the same shape as the instance where each pixel is assigned an integer label (H, W).
+    kernel_fn (Callable): A function that computes the similarity between two images.
+    """
+    def __init__(self, instance: np.ndarray, segments: np.ndarray, kernel_fn: Callable) -> None:
+        super().__init__(instance, segments, kernel_fn, instance)
+
+    def sample(self, n_samples: np.ndarray, progress=True) -> List[Tuple[np.ndarray | float]]:
+        samples = []
+        for _ in tqdm(range(n_samples), disable=not progress, desc='Generating Samples'):
+            representation = np.zeros(np.unique(self.segments).shape[0])
+            perturbation = self.instance
+            weight = self.kernel(self.instance, perturbation)
+            samples.append((representation, perturbation, weight))
+
+        return samples
 
 class LatentSampler(AbstractSampler):
     """A sampler that generates samples using latent space manipulation.
@@ -214,7 +254,7 @@ class LatentSampler(AbstractSampler):
         return representation
     
     @staticmethod
-    def random_walk(latent_instance: torch.Tensor, manipulators: torch.Tensor, radius: float) -> Tuple[torch.Tensor, float]:
+    def random_walk(latent_instance: List[torch.Tensor], manipulators: torch.Tensor, radius: float) -> Tuple[torch.Tensor, float]:
         """
         Walk in the latent space in the direction of a random manipulator until a certain distance is reached.
 
@@ -228,7 +268,7 @@ class LatentSampler(AbstractSampler):
         Returns:
         Tuple[torch.Tensor, float]: A tuple containing the new latent representation and the distance traveled.
         """
-        z = deepcopy(latent_instance)
+        z = latent_copy(latent_instance)
 
         assert len(manipulators) > 0, "At least one manipulator is required."
         assert radius > 0, "The radius must be greater than zero."
@@ -236,20 +276,22 @@ class LatentSampler(AbstractSampler):
         cummulated_direction = torch.zeros_like(z[0])
 
         while True:
-            if torch.norm(cummulated_direction) >= radius:
-                break
-
             # get a random manipulator
             manipulator = random.choice(manipulators)
 
             # sample a random weight
             r = torch.normal(0, 0.3, size=(1,))
 
+            walking_direction = r * manipulator
+
+            if torch.norm(cummulated_direction + walking_direction).item() >= radius:
+                break
+
             # walk in the direction of the manipulator
-            z[0] += r * manipulator
+            z[0] += walking_direction
 
             # update the distance traveled
-            cummulated_direction += r * manipulator
+            cummulated_direction += walking_direction
 
         return z, torch.norm(cummulated_direction).item()
     
